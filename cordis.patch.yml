@@ -1,0 +1,5 @@
+# dsh-auto-archive bundle patch: mount the host plugin under its package name,
+# resolved through the profile's node_modules.
+- insert:
+    - id: auto-archive
+      name: dsh-auto-archive
