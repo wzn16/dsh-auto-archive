@@ -31,6 +31,7 @@ import {
   setConfig,
   setExcluded,
   startScheduler,
+  wirePersistenceForRawLog,
   type AutoArchiveConfig,
   type AutoArchiveHit,
   type ScanResult,
@@ -456,9 +457,9 @@ async function handleList(ctx: HostCtx): Promise<ListResult> {
   }
 
   const query = ctx.get<SessionQueryService>("sessionQuery");
-  // Log-backed title when present, first-user-message fallback otherwise
-  // (older sessions have no committed `session/title` event at all).
-  const titles = await resolveTitles(query, archived);
+  // Log-backed title when present, first-user-message fallback otherwise,
+  // then raw-log recovery for legacy artifacts the query service refuses.
+  const titles = await resolveTitles(query, archived, (id) => byId.get(id) || null);
 
   const liveSvc = ctx.get<SessionsService>("sessions");
   const fsSvc = ctx.get<FsService>("fs");
@@ -730,6 +731,8 @@ export function apply(ctx: HostCtx): Promise<() => Promise<void>> {
   // Seed the harness-root cache before anything reads/writes plugin state;
   // failures are non-fatal (defaults apply, the scheduler retries later).
   const persistenceSvc = ctx.get<SessionPersistence>("sessionPersistence");
+  // Raw-log title tier needs a persistence handle to locate artifacts.
+  wirePersistenceForRawLog(() => ctx.get<SessionPersistence>("sessionPersistence") || null);
   const ready = persistenceSvc
     ? ensureHomeRoot(persistenceSvc).catch(() => undefined)
     : Promise.resolve();

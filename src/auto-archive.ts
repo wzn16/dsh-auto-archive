@@ -20,6 +20,7 @@
  * path service dependency is needed.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { zstdDecompressSync } from "node:zlib";
 import { dirname, join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -143,13 +144,166 @@ function fallbackTitleFromEvents(events: unknown[]): string | null {
  * the first user message — the same idea as the harness's live fallback
  * projection, computed on demand for cold sessions.
  */
-export async function resolveTitles(query: SessionQueryService | undefined, ids: string[]): Promise<Map<string, string>> {
-  const titles = new Map<string, string>();
-  if (!query || ids.length === 0) return titles;
+// ---------------------------------------------------------------------------
+// Raw-log title recovery for artifacts the harness query service refuses to
+// transform (e.g. v0 sessions: "cannot safely transform unclassified message
+// source"). Same process, so node:zlib's zstd is available; logs are
+// multi-frame zstd (one magic per frame), sliced and decoded per frame.
+// ---------------------------------------------------------------------------
 
-  if (typeof query.readTitleSnapshots === "function") {
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+/** Per-process cache so a list refresh never re-decompresses the same log. */
+const rawTitleCache = new Map<string, string | null>();
+/** Hard cap per session log to bound decompression work. */
+const RAW_TEXT_LIMIT = 4 * 1024 * 1024;
+
+function decompressMultiFrame(buf: Buffer): string {
+  const offs: number[] = [];
+  for (let i = 0; i <= buf.length - 4; i++) {
+    if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) {
+      offs.push(i);
+    }
+  }
+  if (offs.length === 0) {
     try {
-      const results = await query.readTitleSnapshots(ids);
+      return zstdDecompressSync(buf).toString("utf8");
+    } catch (e) {
+      return "";
+    }
+  }
+  let text = "";
+  for (let i = 0; i < offs.length; i++) {
+    const end = i + 1 < offs.length ? offs[i + 1] : buf.length;
+    try {
+      text += zstdDecompressSync(buf.subarray(offs[i], end)).toString("utf8");
+    } catch (e) {
+      // torn trailing frame or foreign slice: keep what we have
+    }
+    if (text.length > RAW_TEXT_LIMIT) break;
+  }
+  return text;
+}
+
+/**
+ * Fold a display title straight from raw log lines: the newest committed
+ * `session/title` event if any, else the first user message.
+ */
+function foldTitleFromRawText(text: string): string | null {
+  type RawEvent = { type?: string; data?: { title?: unknown; content?: unknown } } | null;
+  let lastTitle: string | null = null;
+  let firstUser: string | null = null;
+  for (const line of text.split("\n")) {
+    if (line.length === 0) continue;
+    let ev: RawEvent = null;
+    try {
+      ev = JSON.parse(line) as RawEvent;
+    } catch (e) {
+      continue;
+    }
+    if (!ev || typeof ev.type !== "string") continue;
+    if (ev.type === "session/title") {
+      const t = ev.data && typeof ev.data.title === "string" ? ev.data.title.trim() : "";
+      if (t.length > 0) lastTitle = t;
+    } else if (ev.type === "user/message" && firstUser === null) {
+      const t = cleanTitleText(blocksText(ev.data?.content));
+      if (t.length > 0) firstUser = t;
+    }
+  }
+  if (lastTitle) return truncateTitleUtf8(lastTitle, 90);
+  if (firstUser) return truncateTitleUtf8(firstUser, 90);
+  return null;
+}
+
+/** Third-tier title source: decompress the session's on-disk generation logs. */
+function rawLogTitle(persistence: SessionPersistence, header: SessionHeader): string | null {
+  const cached = rawTitleCache.get(header.id);
+  if (cached !== undefined) return cached;
+  let result: string | null = null;
+  try {
+    const location = persistence.locate(header);
+    const p = location && typeof location.path === "string" ? location.path : null;
+    if (p) {
+      seedHomeRootFromArtifact(p);
+      const dir = dirname(p);
+      const files = existsSync(dir) ? readdirSync(dir) : [];
+      let text = "";
+      for (const name of files) {
+        if (!/^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(name)) continue; // generation logs only
+        try {
+          const buf = readFileSync(join(dir, name));
+          text += name.endsWith(".zstd") ? decompressMultiFrame(buf) : buf.toString("utf8");
+        } catch (e) {
+          // unreadable generation: skip it
+        }
+        if (text.length > RAW_TEXT_LIMIT) break;
+      }
+      if (text.length > 0) result = foldTitleFromRawText(text);
+    }
+  } catch (e) {
+    result = null;
+  }
+  rawTitleCache.set(header.id, result);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// 标题磁盘缓存：成功标题跨启动复用；预算限时防止列表首载卡死（2026-09-26）
+// ---------------------------------------------------------------------------
+const TITLES_DISK_FILE = "dsh-auto-archive.titles.json";
+const titlesDisk: Map<string, string> = new Map();
+let titlesDiskLoaded = false;
+function titlesDiskMap(): Map<string, string> {
+  if (titlesDiskLoaded) return titlesDisk;
+  titlesDiskLoaded = true;
+  try {
+    if (!cachedHomeRoot) return titlesDisk;
+    const p = join(cachedHomeRoot, TITLES_DISK_FILE);
+    if (!existsSync(p)) return titlesDisk;
+    const raw = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (typeof v === "string" && v) titlesDisk.set(k, v);
+    }
+  } catch {
+    titlesDisk.clear();
+  }
+  return titlesDisk;
+}
+function saveTitlesDisk(): void {
+  try {
+    if (!cachedHomeRoot) return;
+    const obj: Record<string, string> = {};
+    for (const [k, v] of titlesDisk) obj[k] = v;
+    const p = join(cachedHomeRoot, TITLES_DISK_FILE);
+    const tmp = p + ".tmp";
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, p);
+  } catch { /* 写失败不影响主流程 */ }
+}
+
+export async function resolveTitles(
+  query: SessionQueryService | undefined,
+  ids: string[],
+  headerById?: (id: string) => SessionHeader | null
+): Promise<Map<string, string>> {
+  const titles = new Map<string, string>();
+  if (ids.length === 0) return titles;
+
+  // 磁盘缓存命中直接用；未命中的才走解析（解析开销大：逐会话查询 + zstd 解压旧日志）
+  const disk = titlesDiskMap();
+  const pending: string[] = [];
+  for (const id of ids) {
+    const hit = disk.get(id);
+    if (hit !== undefined) {
+      titles.set(id, hit);
+      continue;
+    }
+    pending.push(id);
+  }
+  if (pending.length === 0) return titles;
+  const titleDeadline = Date.now() + 20000;
+  if (query && typeof query.readTitleSnapshots === "function") {
+    try {
+      const results = await query.readTitleSnapshots(pending);
       for (const r of results || []) {
         if (r && r.status === "fulfilled" && r.value && r.value.title && typeof r.value.title.title === "string") {
           titles.set(r.sessionId, r.value.title.title);
@@ -160,12 +314,13 @@ export async function resolveTitles(query: SessionQueryService | undefined, ids:
     }
   }
 
-  const missing = ids.filter((id) => !titles.has(id));
-  const readSession = typeof query.readSession === "function" ? query.readSession.bind(query) : null;
+  const missing = pending.filter((id) => !titles.has(id));
+  const readSession = query && typeof query.readSession === "function" ? query.readSession.bind(query) : null;
   if (missing.length > 0 && readSession) {
     let cursor = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
+        if (Date.now() > titleDeadline) return;
         const i = cursor++;
         if (i >= missing.length) return;
         const id = missing[i];
@@ -177,13 +332,42 @@ export async function resolveTitles(query: SessionQueryService | undefined, ids:
             if (title) titles.set(id, title);
           }
         } catch (e) {
-          // unreadable session: leave it untitled
+          // unreadable through the query service; the raw-log tier may still work
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(8, missing.length) }, () => worker()));
   }
+
+  // Third tier: cold sessions the query service refuses to transform (v0 and
+  // other legacy generations). Read the generation logs straight from disk.
+  const stillMissing = pending.filter((id) => !titles.has(id));
+  if (stillMissing.length > 0 && headerById && persistenceForRawLog) {
+    const persistence = persistenceForRawLog();
+    if (persistence) {
+      for (const id of stillMissing) {
+        if (Date.now() > titleDeadline) break;
+        const header = headerById(id);
+        if (!header) continue;
+        const title = rawLogTitle(persistence, header);
+        if (title) titles.set(id, title);
+      }
+    }
+  }
+  // 成功标题落盘，跨启动复用；本轮预算内没解出来的下轮继续
+  for (const [id, t] of titles) {
+    if (!disk.has(id)) disk.set(id, t);
+  }
+  saveTitlesDisk();
   return titles;
+}
+
+/** Persistence handle wired in by the host half for the raw-log tier. */
+let persistenceForRawLog: (() => SessionPersistence | null) | null = null;
+
+/** Host half calls this once at apply() so the raw tier can locate artifacts. */
+export function wirePersistenceForRawLog(get: () => SessionPersistence | null): void {
+  persistenceForRawLog = get;
 }
 
 // ---------------------------------------------------------------------------
@@ -645,35 +829,36 @@ export async function listAllSessions(ctx: AutoArchiveCtx): Promise<SessionOverv
   const now = Date.now();
 
   const entries = await persistence.list();
-  const rows: Array<{ id: string; lastActiveAt: number | null; running: boolean; live: boolean }> = [];
+  const rows: Array<{ header: SessionHeader; lastActiveAt: number | null; running: boolean; live: boolean }> = [];
   for (const entry of entries) {
     const header = headerOf(entry);
     if (!header || archivedSet.has(header.id)) continue;
     const agent = agents && typeof agents.get === "function" ? agents.get(header.id) : undefined;
     const live = agent !== undefined && agent !== null;
     rows.push({
-      id: header.id,
+      header,
       lastActiveAt: lastActiveAtOf(persistence, header),
       running: !!(live && agent && agent.status === "running"),
       live
     });
   }
 
-  const titles = await resolveTitles(query, rows.map((r) => r.id));
+  const headerById = new Map(rows.map((r) => [r.header.id, r.header] as const));
+  const titles = await resolveTitles(query, rows.map((r) => r.header.id), (id) => headerById.get(id) || null);
 
   return rows.map((r) => {
     const idleDays =
       r.lastActiveAt === null ? null : Math.max(0, Math.floor((now - r.lastActiveAt) / (24 * 60 * 60 * 1000)));
     const meetsIdle = r.lastActiveAt !== null && now - r.lastActiveAt >= idleMs;
     return {
-      id: r.id,
-      title: titles.get(r.id) || null,
+      id: r.header.id,
+      title: titles.get(r.header.id) || null,
       idleDays,
       lastActiveAt: r.lastActiveAt,
       running: r.running,
       live: r.live,
-      excluded: excluded.has(r.id),
-      wouldAutoArchive: meetsIdle && !excluded.has(r.id) && !r.live && !r.running
+      excluded: excluded.has(r.header.id),
+      wouldAutoArchive: meetsIdle && !excluded.has(r.header.id) && !r.live && !r.running
     };
   });
 }
