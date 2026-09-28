@@ -156,11 +156,40 @@ const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
 /** Per-process cache so a list refresh never re-decompresses the same log. */
 const rawTitleCache = new Map<string, string | null>();
 /**
- * Per-process negative cache: sessions where every tier failed (empty logs
- * etc.). Without it, every list call re-spends the readSession fallback
- * budget on the same hopeless ids.
+ * Negative cache: sessions where every tier failed (empty logs etc.).
+ * Without it, every list call re-spends the readSession fallback budget on
+ * the same hopeless ids. Mirrored to disk so a restart does not re-pay the
+ * cost either.
  */
 const titlelessCache = new Set<string>();
+const TITLELESS_DISK_FILE = "dsh-auto-archive.titleless.json";
+let titlelessLoaded = false;
+function titlelessLoad(): void {
+  if (titlelessLoaded) return;
+  titlelessLoaded = true;
+  try {
+    if (!cachedHomeRoot) return;
+    const p = join(cachedHomeRoot, TITLELESS_DISK_FILE);
+    if (!existsSync(p)) return;
+    const raw = JSON.parse(readFileSync(p, "utf8")) as unknown;
+    if (Array.isArray(raw)) {
+      for (const id of raw) if (typeof id === "string" && id.length > 0) titlelessCache.add(id);
+    }
+  } catch {
+    // corrupt file: start empty
+  }
+}
+function titlelessSave(): void {
+  try {
+    if (!cachedHomeRoot) return;
+    const p = join(cachedHomeRoot, TITLELESS_DISK_FILE);
+    const tmp = p + ".tmp";
+    writeFileSync(tmp, JSON.stringify([...titlelessCache]));
+    renameSync(tmp, p);
+  } catch {
+    // best-effort
+  }
+}
 /** Hard cap per session log to bound decompression work. */
 const RAW_TEXT_LIMIT = 4 * 1024 * 1024;
 
@@ -297,6 +326,7 @@ export async function resolveTitles(
   if (ids.length === 0) return titles;
 
   // 磁盘缓存命中直接用；未命中的才走解析（解析开销大：逐会话查询 + zstd 解压旧日志）
+  titlelessLoad();
   const disk = titlesDiskMap();
   const pending: string[] = [];
   for (const id of ids) {
@@ -305,7 +335,7 @@ export async function resolveTitles(
       titles.set(id, hit);
       continue;
     }
-    // 进程内负缓存：三层都解不出标题的会话（空日志等）不再反复重试，
+    // 负缓存（进程内+落盘）：三层都解不出标题的会话（空日志等）不再反复重试，
     // 否则每次 list 都会对它们烧满 readSession 兜底预算（实测 5s/次）。
     if (titlelessCache.has(id)) continue;
     pending.push(id);
@@ -357,11 +387,11 @@ export async function resolveTitles(
   // Last tier: sessions the two local tiers could not read but the query
   // service still can (e.g. artifacts on a backend node:fs cannot see).
   // Shortest budget — slowest per-session transform, mostly redundant with the
-  // tiers above.
+  // tiers above. Failures here land in the negative cache either way.
   const missing = pending.filter((id) => !titles.has(id));
   const readSession = query && typeof query.readSession === "function" ? query.readSession.bind(query) : null;
   if (missing.length > 0 && readSession) {
-    const readSessionDeadline = Date.now() + 5000;
+    const readSessionDeadline = Date.now() + 2000;
     let cursor = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -383,9 +413,12 @@ export async function resolveTitles(
     };
     await Promise.all(Array.from({ length: Math.min(8, missing.length) }, () => worker()));
   }
-  // 三层都没解出的记入进程内负缓存，下次 list 不再对它们花预算
-  for (const id of pending) {
-    if (!titles.has(id)) titlelessCache.add(id);
+  // 三层都没解出的记入负缓存（进程内+落盘），下次 list / 下次启动都不再对它们花预算
+  if (missing.length > 0) {
+    for (const id of missing) {
+      if (!titles.has(id)) titlelessCache.add(id);
+    }
+    titlelessSave();
   }
   // 成功标题落盘，跨启动复用；本轮预算内没解出来的下轮继续
   for (const [id, t] of titles) {

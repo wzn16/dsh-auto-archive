@@ -657,14 +657,26 @@ interface AutoPreview {
   errors: string[];
 }
 
-/** Compact dry-run scan for the settings panel. */
+/** Compact dry-run scan for the settings panel.
+ *
+ * Every settings-page open fires auto-status, and each preview walks the full
+ * session store (hundreds of stat calls, ~1s of synchronous work). Under load
+ * (a busy turn elsewhere + the boot-time first scan) that stacks up behind
+ * everything else and the page looks frozen. Cache the result briefly; the
+ * panel's explicit "立即扫描" buttons always bypass it. */
+let previewCache: { at: number; value: AutoPreview } | null = null;
+const PREVIEW_CACHE_MS = 60_000;
+
 async function autoPreview(ctx: HostCtx): Promise<AutoPreview> {
+  if (previewCache && Date.now() - previewCache.at < PREVIEW_CACHE_MS) return previewCache.value;
   const result = await scanAndArchive(ctx, { dryRun: true });
-  return {
+  const value: AutoPreview = {
     total: result.preview.length,
     items: result.preview.slice(0, AUTO_PREVIEW_CAP),
     errors: result.errors
   };
+  previewCache = { at: Date.now(), value };
+  return value;
 }
 
 async function handleAutoStatus(ctx: HostCtx, scheduler: SchedulerHandle): Promise<Record<string, unknown>> {
@@ -697,6 +709,7 @@ async function handleAutoConfigSet(ctx: HostCtx, args: unknown): Promise<Record<
 
 async function handleAutoScan(ctx: HostCtx, args: unknown, scheduler: SchedulerHandle): Promise<ScanResult> {
   const dryRun = !!(args && typeof args === "object" && (args as Record<string, unknown>).dryRun === true);
+  previewCache = null; // explicit scan: always fresh
   if (dryRun) return scanAndArchive(ctx, { dryRun: true });
   return scheduler.runNow();
 }
@@ -1054,7 +1067,7 @@ function existsTrash(trashDir: string): boolean {
 // ---------------------------------------------------------------------------
 
 /** Delay before the first scheduled pass; lets the harness finish booting. */
-const AUTO_WARMUP_MS = 3 * 60 * 1000;
+const AUTO_WARMUP_MS = 5 * 60 * 1000;
 
 export function apply(ctx: HostCtx): Promise<() => Promise<void>> {
   // Seed the harness-root cache before anything reads/writes plugin state;
