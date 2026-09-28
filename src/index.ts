@@ -19,7 +19,7 @@
  * regenerated with `npm run build`.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -358,56 +358,21 @@ async function dirSizeOfTarget(fsSvc: FsService, target: FsTarget, depth: number
 }
 
 /**
- * Resolve an explicit danger-full-access policy so the shell executor runs the
- * deletion unconfined. On Windows deployments where the ACL sandbox backend
- * cannot start (its temp root must live outside the workspace), any confined
- * mode would fail before the command even runs.
+ * Delete a session directory recursively with node:fs (cross-platform).
  *
- * Verified against 0.1.5-rc.1: `sandboxPolicy.resolve({ mode })` still returns
- * the resolved policy natively, and the shell request still accepts it.
+ * The legacy path drove the harness shell executor (`rm -rf` / PowerShell
+ * `Remove-Item`), but current builds no longer expose a `shell` service on
+ * plugin contexts — every delete failed with "shell executor unavailable"
+ * (2026-09-28). This plugin already reads the session store directly through
+ * node:fs everywhere else, so it deletes through it too. rmSync handles
+ * read-only attributes and long paths on Windows; force ignores ENOENT.
  */
-function dangerPolicy(ctx: HostCtx): unknown {
-  const sp = ctx.get<SandboxPolicyService>("sandboxPolicy");
-  if (!sp || typeof sp.resolve !== "function") return undefined;
-  try {
-    return sp.resolve({ mode: "danger-full-access" });
-  } catch (e) {
-    return undefined;
-  }
-}
-
-/** Delete a directory recursively through the shell executor (pwsh / rm). */
 async function removeDir(ctx: HostCtx, dirPath: string): Promise<void> {
-  const shell = ctx.get<ShellService>("shell");
-  if (!shell || typeof shell.resolve !== "function" || typeof shell.run !== "function") {
-    throw new Error("shell executor unavailable; cannot delete from disk");
-  }
-  const isWindows = /^[A-Za-z]:[\\/]/.test(dirPath);
-  const command = isWindows
-    ? "Remove-Item -LiteralPath '" + dirPath.replace(/'/g, "''") + "' -Recurse -Force -ErrorAction Stop"
-    : "rm -rf -- '" + dirPath.replace(/'/g, "'\\''") + "'";
-  const request: { command: string; timeoutMs: number; sandboxPolicy?: unknown } = {
-    command,
-    timeoutMs: 60000
-  };
-  const policy = dangerPolicy(ctx);
-  if (policy) request.sandboxPolicy = policy;
-  let spec: unknown;
   try {
-    spec = shell.resolve(request);
+    rmSync(dirPath, { recursive: true, force: true });
   } catch (e) {
-    throw new Error("shell resolve failed: " + String((e && (e as Error).message) || e));
+    throw new Error("删除目录失败: " + dirPath + " — " + String((e && (e as Error).message) || e));
   }
-  const result = await shell.run(spec);
-  if (result && result.exitCode === 0) return;
-  let detail = "";
-  try {
-    const out = result && (result.stderr || result.stdout);
-    if (out && typeof out.text === "string") detail = out.text.slice(0, 400);
-  } catch (e) {
-    detail = "";
-  }
-  throw new Error("删除失败 (exit " + String(result && result.exitCode) + "): " + (detail || dirPath));
 }
 
 /**
