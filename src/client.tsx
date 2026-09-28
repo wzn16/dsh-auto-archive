@@ -296,6 +296,7 @@ function AutoArchiveCard({ onChanged }: { onChanged: () => void }) {
   const [showSessions, setShowSessions] = React.useState(false);
   const [sessions, setSessions] = React.useState<SessionOverview[] | null>(null);
   const [sessBusy, setSessBusy] = React.useState<string | null>(null);
+  const [delArmId, setDelArmId] = React.useState<string | null>(null);
 
   function minutesToDays(minutes: number): string {
     const days = Math.round((minutes / 1440) * 100) / 100;
@@ -395,6 +396,32 @@ function AutoArchiveCard({ onChanged }: { onChanged: () => void }) {
     setError(null);
     api<unknown>("auto-exclude", { sessionId: id, add })
       .then(() => loadSessions())
+      .catch((err) => setError(describe(err)))
+      .finally(() => setSessBusy(null));
+  }
+
+  // 两步确认的删除：删除 → 确认（5 秒后自动取消），与归档列表的删除同款交互
+  function armDelete(id: string): void {
+    setDelArmId(id);
+    try {
+      window.setTimeout(() => {
+        setDelArmId((cur) => (cur === id ? null : cur));
+      }, 5000);
+    } catch (e) {
+      // timer 不可用时保持待确认状态
+    }
+  }
+
+  function deleteOneNow(id: string): void {
+    setSessBusy("delete:" + id);
+    setError(null);
+    api<unknown>("auto-delete-one", { sessionId: id })
+      .then(() => {
+        setNotice("已删除 1 个会话（含日志文件，不可恢复）");
+        setDelArmId(null);
+        loadSessions();
+        onChanged();
+      })
       .catch((err) => setError(describe(err)))
       .finally(() => setSessBusy(null));
   }
@@ -577,7 +604,31 @@ function AutoArchiveCard({ onChanged }: { onChanged: () => void }) {
                         </button>
                       ) : (
                         <button className="dsw-arch-btn" disabled={sessBusy !== null} onClick={() => setExcludedNow(s.id, true)}>
-                          永不自动归档
+                          排除
+                        </button>
+                      )}
+                      {delArmId === s.id ? (
+                        <React.Fragment>
+                          <span className="dsw-auto-status" style={{ color: "var(--dsw-alias-state-error-primary)" }}>
+                            确认删除？
+                          </span>
+                          <button
+                            className="dsw-arch-btn dsw-arch-btn-danger"
+                            disabled={sessBusy !== null}
+                            title="从硬盘删除该会话及其日志，不可恢复（5 秒后自动取消）"
+                            onClick={() => deleteOneNow(s.id)}
+                          >
+                            {sessBusy === "delete:" + s.id ? "删除中…" : "确认删除"}
+                          </button>
+                        </React.Fragment>
+                      ) : (
+                        <button
+                          className="dsw-arch-btn dsw-arch-btn-danger"
+                          disabled={s.running || sessBusy !== null}
+                          title="从硬盘删除该会话（两步确认，5 秒后自动取消）"
+                          onClick={() => armDelete(s.id)}
+                        >
+                          删除
                         </button>
                       )}
                     </span>

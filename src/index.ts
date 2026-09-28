@@ -719,6 +719,50 @@ async function handleAutoSessions(ctx: HostCtx): Promise<{ items: SessionOvervie
   return { items: await listAllSessions(ctx) };
 }
 
+/**
+ * Delete ONE not-yet-archived session straight from the workspace list —
+ * the capability the official client lacks (it only offers archive, so
+ * deleting required the archive→panel→delete detour). Same guards as the
+ * archived delete path: never a running turn, live sessions evicted from
+ * memory first, directory removed via node:fs. The id is not in the archive
+ * set, so no registry write is needed — the session simply ceases to exist.
+ */
+async function handleAutoDeleteOne(ctx: HostCtx, args: unknown): Promise<Record<string, unknown>> {
+  const sessionId = sessionIdOf(args);
+  const agents = ctx.get<AgentsService>("agents");
+  const agent = agents && typeof agents.get === "function" ? agents.get(sessionId) : undefined;
+  if (agent && agent.status === "running") {
+    throw new Error("会话 '" + sessionId + "' 正在运行中，无法删除");
+  }
+  const persistence = ctx.get<SessionPersistence>("sessionPersistence");
+  if (!persistence) throw new Error("session persistence unavailable");
+  const headers = await persistence.list();
+  let header: SessionHeader | null = null;
+  for (const entry of headers) {
+    const candidate = headerOf(entry);
+    if (candidate && candidate.id === sessionId) {
+      header = candidate;
+      break;
+    }
+  }
+  if (!header) return { ok: true, deleted: false, reason: "no-artifact", sessionId };
+  let location: { path?: string } | null | undefined = null;
+  try {
+    location = persistence.locate(header);
+  } catch (e) {
+    location = null;
+  }
+  const dirPath = location && typeof location.path === "string" ? parentDir(location.path) : null;
+  if (!dirPath) return { ok: true, deleted: false, reason: "no-artifact", sessionId };
+  const liveSvc = ctx.get<SessionsService>("sessions");
+  const isLive = !!(liveSvc && typeof liveSvc.get === "function" && liveSvc.get(sessionId) !== undefined);
+  if (isLive && !evictSessionFromMemory(ctx, sessionId)) {
+    throw new Error("会话 '" + sessionId + "' 仍驻留内存且无法移除，删除未完成；请重启 Harness 后重试");
+  }
+  await removeDir(ctx, dirPath);
+  return { ok: true, deleted: true, sessionId, path: dirPath };
+}
+
 /** Manually archive ONE session (guarded like the scanner: never a running turn). */
 async function handleAutoArchiveOne(ctx: HostCtx, args: unknown): Promise<Record<string, unknown>> {
   const sessionId = sessionIdOf(args);
@@ -1094,6 +1138,7 @@ export function apply(ctx: HostCtx): Promise<() => Promise<void>> {
     "auto-scan": (args) => handleAutoScan(ctx, args, scheduler),
     "auto-sessions": () => handleAutoSessions(ctx),
     "auto-archive-one": (args) => handleAutoArchiveOne(ctx, args),
+    "auto-delete-one": (args) => handleAutoDeleteOne(ctx, args),
     "auto-exclude": (args) => handleAutoExclude(ctx, args),
     "attachment-status": () => handleAttachmentStatus(ctx),
     "attachment-clean": (args) => handleAttachmentClean(ctx, args),
