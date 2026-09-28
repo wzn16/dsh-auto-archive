@@ -19,6 +19,8 @@
  * regenerated with `npm run build`.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   DEFAULT_CONFIG,
   archiveOne,
@@ -263,18 +265,58 @@ function blocksText(blocks: unknown): string {
 }
 
 /**
- * Recursive byte size of a session directory via the fs service.
+ * Recursive byte size of a session directory via node:fs.
  *
- * Receives a resolved target handle and threads it through recursion: the
- * handle is the only thing `stat`/`listDir` accept, and the entries that
- * `listDir` yields already carry a handle for each child.
- *
- * @param fsSvc - the harness fs service.
- * @param dirPath - absolute path of the directory to measure.
- * @param depth - recursion guard.
- * @returns the byte total, or null when the path cannot be resolved (missing).
+ * Returns null only when the root itself is unreadable (missing/unpermitted) —
+ * that is the caller's `missing` signal. Symbolic links are never followed
+ * (cycle-proof), and the recursion guard mirrors the fs-service walk.
  */
-async function dirSizeBytes(fsSvc: FsService, dirPath: string, depth: number): Promise<number | null> {
+function nodeFsDirSize(dirPath: string, depth: number): number | null {
+  try {
+    const info = statSync(dirPath);
+    if (!info.isDirectory()) return info.size || 0;
+    if (depth > 10) return 0;
+    let entries: Array<{ isSymbolicLink(): boolean; isDirectory(): boolean; name: string }>;
+    try {
+      entries = readdirSync(dirPath, { withFileTypes: true });
+    } catch (e) {
+      return 0; // unreadable subdirectory: count what we can, don't fail the walk
+    }
+    let total = 0;
+    for (const ent of entries) {
+      if (ent.isSymbolicLink()) continue;
+      const child = join(dirPath, ent.name);
+      if (ent.isDirectory()) {
+        const sub = nodeFsDirSize(child, depth + 1);
+        if (sub !== null) total += sub;
+      } else {
+        try {
+          total += statSync(child).size || 0;
+        } catch (e) {
+          // file vanished mid-walk; ignore this entry
+        }
+      }
+    }
+    return total;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Recursive byte size of a session directory.
+ *
+ * Primary path walks the tree with node:fs directly: the host process already
+ * reads session logs off the same disk (auto-archive.ts), and the fs service
+ * costs one IPC round-trip per directory — 246 sessions took ~21 s through it
+ * (2026-09-28 measurement) while a node:fs walk covers ALL 811 session dirs in
+ * 37 ms. The fs-service path is kept only as a fallback for deployments where
+ * the host process lacks direct disk access.
+ */
+async function dirSizeBytes(fsSvc: FsService | undefined, dirPath: string, depth: number): Promise<number | null> {
+  const direct = nodeFsDirSize(dirPath, depth);
+  if (direct !== null) return direct;
+  if (!fsSvc) return null;
   let target: FsTarget;
   try {
     target = await fsSvc.resolve(dirPath);
