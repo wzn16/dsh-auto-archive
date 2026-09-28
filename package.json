@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-archive",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Auto-archive for DeepSeek Harness: periodically archives sessions idle beyond a threshold, plus full archived-session management (list/unarchive/delete/detail) in the web UI. · DSH 自动归档：按闲置天数自动归档会话，含归档管理面板。",
   "type": "module",
   "main": "lib/index.js",

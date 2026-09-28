@@ -859,6 +859,13 @@ async function scanReferencedShas(ctx: HostCtx): Promise<{ shas: Set<string>; sc
       shas.add(m[0]);
       m = SHA_HEX_RE.exec(text);
     }
+    // The zstd decompression above is synchronous CPU work; without yielding,
+    // the host cannot serve ANY concurrent request for the whole scan — the
+    // archive list just hangs for seconds and looks broken. Give the event
+    // loop a breather every few sessions.
+    if (scanned % 8 === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
   }
   return { shas, scanned };
 }

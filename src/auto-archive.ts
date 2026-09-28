@@ -155,6 +155,12 @@ function fallbackTitleFromEvents(events: unknown[]): string | null {
 const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
 /** Per-process cache so a list refresh never re-decompresses the same log. */
 const rawTitleCache = new Map<string, string | null>();
+/**
+ * Per-process negative cache: sessions where every tier failed (empty logs
+ * etc.). Without it, every list call re-spends the readSession fallback
+ * budget on the same hopeless ids.
+ */
+const titlelessCache = new Set<string>();
 /** Hard cap per session log to bound decompression work. */
 const RAW_TEXT_LIMIT = 4 * 1024 * 1024;
 
@@ -299,6 +305,9 @@ export async function resolveTitles(
       titles.set(id, hit);
       continue;
     }
+    // 进程内负缓存：三层都解不出标题的会话（空日志等）不再反复重试，
+    // 否则每次 list 都会对它们烧满 readSession 兜底预算（实测 5s/次）。
+    if (titlelessCache.has(id)) continue;
     pending.push(id);
   }
   if (pending.length === 0) return titles;
@@ -330,12 +339,17 @@ export async function resolveTitles(
   if (stillMissing.length > 0 && headerById && persistenceForRawLog) {
     const persistence = persistenceForRawLog();
     if (persistence) {
+      let done = 0;
       for (const id of stillMissing) {
         if (Date.now() > rawLogDeadline) break;
         const header = headerById(id);
         if (!header) continue;
         const title = rawLogTitle(persistence, header);
         if (title) titles.set(id, title);
+        // rawLogTitle 同步解压：批量解析时周期性让出 event loop，
+        // 避免宿主 Web 服务在解压期间无法响应任何并发请求。
+        done++;
+        if (done % 8 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
   }
@@ -368,6 +382,10 @@ export async function resolveTitles(
       }
     };
     await Promise.all(Array.from({ length: Math.min(8, missing.length) }, () => worker()));
+  }
+  // 三层都没解出的记入进程内负缓存，下次 list 不再对它们花预算
+  for (const id of pending) {
+    if (!titles.has(id)) titlelessCache.add(id);
   }
   // 成功标题落盘，跨启动复用；本轮预算内没解出来的下轮继续
   for (const [id, t] of titles) {
