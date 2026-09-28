@@ -137,6 +137,8 @@ export interface AttachmentStatus {
   unusedCount: number;
   unusedBytes: number;
   items: AttachmentItem[];
+  trashFiles?: number;
+  trashBytes?: number;
   scannedSessions: number;
   durationMs: number;
 }
@@ -608,6 +610,8 @@ function AttachmentCleanupCard() {
   const [scanning, setScanning] = React.useState(false);
   const [armed, setArmed] = React.useState(false);
   const [cleaning, setCleaning] = React.useState(false);
+  const [trashArmed, setTrashArmed] = React.useState(false);
+  const [clearingTrash, setClearingTrash] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -623,6 +627,7 @@ function AttachmentCleanupCard() {
     setError(null);
     setNotice(null);
     setArmed(false);
+    setTrashArmed(false);
     api<AttachmentStatus>("attachment-status", {})
       .then((res) => {
         setStatus(res);
@@ -643,7 +648,7 @@ function AttachmentCleanupCard() {
     api<{ ok: boolean; deleted: number; freedBytes: number; errors: string[] }>("attachment-clean", { shas })
       .then((res) => {
         setNotice(
-          "已清理 " + res.deleted + " 个附件，释放 " + fmtSize(res.freedBytes) +
+          "已移入回收站 " + res.deleted + " 个附件（" + fmtSize(res.freedBytes) + "）；确认不再需要后可清空回收站" +
             (res.errors && res.errors.length > 0 ? "；" + res.errors.length + " 个失败" : "")
         );
         setArmed(false);
@@ -656,16 +661,33 @@ function AttachmentCleanupCard() {
       });
   }
 
+  function clearTrash(): void {
+    setClearingTrash(true);
+    setError(null);
+    setNotice(null);
+    api<{ ok: boolean; files: number; freedBytes: number }>("attachment-trash-clear", {})
+      .then((res) => {
+        setNotice("回收站已清空：彻底删除 " + res.files + " 个文件，释放 " + fmtSize(res.freedBytes));
+        setTrashArmed(false);
+        setClearingTrash(false);
+        scan();
+      })
+      .catch((err) => {
+        setError(describe(err));
+        setClearingTrash(false);
+      });
+  }
+
   return (
     <div className="dsw-auto-card">
       <div className="dsw-auto-head">
         <span className="dsw-auto-title">附件清理</span>
         <span className="dsw-auto-status">
-          找出未被任何未归档会话引用的贴图附件（只被已归档/已删除会话使用），清理不可逆
+          找出未被任何未归档会话及其历史（继续会话的血统链）引用的贴图附件；清理 = 移入回收站，可随时手动移回，清空回收站才真正删除
         </span>
       </div>
       <div className="dsw-auto-row">
-        <button className="dsw-arch-btn" disabled={scanning || cleaning} onClick={() => scan()}>
+        <button className="dsw-arch-btn" disabled={scanning || clearingTrash} onClick={() => scan()}>
           {scanning ? "扫描中…（全量解压会话日志，约十几秒）" : "扫描可清理附件"}
         </button>
         {status && status.available ? (
@@ -675,6 +697,7 @@ function AttachmentCleanupCard() {
               {status.unusedCount} 个 / {fmtSize(status.unusedBytes)}
             </strong>
             （扫描 {status.scannedSessions} 个会话 · {(status.durationMs / 1000).toFixed(1)}s）
+            {status.trashFiles ? " · 回收站 " + status.trashFiles + " 个 / " + fmtSize(status.trashBytes || 0) : ""}
           </span>
         ) : null}
         {status && !status.available ? (
@@ -684,10 +707,10 @@ function AttachmentCleanupCard() {
       {armed && status ? (
         <div className="dsw-auto-row">
           <span className="dsw-auto-status" style={{ color: "var(--dsw-alias-state-warn-primary)" }}>
-            确认永久删除 {status.items.length} 个附件文件（{fmtSize(status.unusedBytes)}）？不可恢复。
+            把 {status.items.length} 个附件（{fmtSize(status.unusedBytes)}）移入回收站？移入后随时可手动移回 objects 目录恢复。
           </span>
           <button className="dsw-arch-btn dsw-arch-btn-danger" disabled={cleaning} onClick={() => clean()}>
-            {cleaning ? "清理中…" : "确认清理"}
+            {cleaning ? "清理中…" : "确认移入回收站"}
           </button>
           <button className="dsw-arch-btn" disabled={cleaning} onClick={() => setArmed(false)}>取消</button>
         </div>
@@ -697,6 +720,25 @@ function AttachmentCleanupCard() {
           <button className="dsw-arch-btn dsw-arch-btn-danger" disabled={cleaning} onClick={() => setArmed(true)}>
             清理这 {status.unusedCount} 个附件…
           </button>
+        </div>
+      ) : null}
+      {status && status.trashFiles ? (
+        <div className="dsw-auto-row">
+          {trashArmed ? (
+            <React.Fragment>
+              <span className="dsw-auto-status" style={{ color: "var(--dsw-alias-state-warn-primary)" }}>
+                确认彻底删除回收站里的 {status.trashFiles} 个文件（{fmtSize(status.trashBytes || 0)}）？此步之后不可恢复。
+              </span>
+              <button className="dsw-arch-btn dsw-arch-btn-danger" disabled={clearingTrash} onClick={() => clearTrash()}>
+                {clearingTrash ? "清空中…" : "确认清空"}
+              </button>
+              <button className="dsw-arch-btn" disabled={clearingTrash} onClick={() => setTrashArmed(false)}>取消</button>
+            </React.Fragment>
+          ) : (
+            <button className="dsw-arch-btn" disabled={clearingTrash} onClick={() => setTrashArmed(true)}>
+              清空回收站（{status.trashFiles} 个 / {fmtSize(status.trashBytes || 0)}）…
+            </button>
+          )}
         </div>
       ) : null}
       {notice ? (

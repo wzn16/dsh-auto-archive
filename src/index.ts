@@ -19,7 +19,7 @@
  * regenerated with `npm run build`.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { readdirSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -763,6 +763,8 @@ interface AttachmentStatusResult {
   unusedCount: number;
   unusedBytes: number;
   items: AttachmentFile[];
+  trashFiles: number;
+  trashBytes: number;
   scannedSessions: number;
   durationMs: number;
 }
@@ -778,7 +780,24 @@ function attachmentsObjectsDir(): string | null {
   }
 }
 
-/** Shas referenced by ANY not-yet-archived session log (all generations). */
+/** Trash staging directory: cleaned attachments land here (recoverable by
+ * moving them back into objects/<2hex>/) until the user empties it. */
+function attachmentsTrashDir(): string {
+  const root = harnessHomeRoot() || join(homedir(), ".dsh");
+  return join(root, "attachments", "v1", "trash");
+}
+
+/**
+ * Shas referenced by ANY not-yet-archived session log — plus the FULL parent
+ * lineage of every one of them.
+ *
+ * The lineage walk matters: a "continued" child session stores only its own
+ * tail in its log, while the real history (and every image attachment ref in
+ * it) lives in the archived parent. Replaying the child re-reads the parent's
+ * images (readImageFile, hash-verified), so cleaning a parent-referenced
+ * attachment breaks the child with "Attachment object is missing" (2026-09-28
+ * incident). Archived ancestors are therefore treated as LIVE.
+ */
 async function scanReferencedShas(ctx: HostCtx): Promise<{ shas: Set<string>; scanned: number }> {
   const shas = new Set<string>();
   const persistence = ctx.get<SessionPersistence>("sessionPersistence");
@@ -787,10 +806,32 @@ async function scanReferencedShas(ctx: HostCtx): Promise<{ shas: Set<string>; sc
   const rawArchived = registry && registry.archivedSessionIds;
   const archived = new Set<string>(Array.isArray(rawArchived) ? rawArchived : []);
   const entries = await persistence.list();
-  let scanned = 0;
+  const headerMap = new Map<string, SessionHeader>();
   for (const entry of entries) {
-    const header = headerOf(entry);
-    if (!header || archived.has(header.id)) continue;
+    const h = headerOf(entry);
+    if (h && typeof h.id === "string") headerMap.set(h.id, h);
+  }
+  // 未归档会话本身 + 沿 parentSession 上溯的全部祖先（哪怕已归档）。
+  const scanIds = new Set<string>();
+  const queue: string[] = [];
+  for (const [id] of headerMap) {
+    if (!archived.has(id)) {
+      scanIds.add(id);
+      queue.push(id);
+    }
+  }
+  while (queue.length > 0) {
+    const id = queue.pop() as string;
+    const h = headerMap.get(id);
+    const parent = h && h.parentSession && typeof h.parentSession === "string" ? h.parentSession : null;
+    if (parent && headerMap.has(parent) && !scanIds.has(parent)) {
+      scanIds.add(parent);
+      queue.push(parent);
+    }
+  }
+  let scanned = 0;
+  for (const id of scanIds) {
+    const header = headerMap.get(id) as SessionHeader;
     let location: { path?: string } | null | undefined = null;
     try {
       location = persistence.locate(header);
@@ -847,6 +888,8 @@ async function handleAttachmentStatus(ctx: HostCtx): Promise<AttachmentStatusRes
     unusedCount: 0,
     unusedBytes: 0,
     items: [],
+    trashFiles: 0,
+    trashBytes: 0,
     scannedSessions: 0,
     durationMs: 0
   };
@@ -889,6 +932,30 @@ async function handleAttachmentStatus(ctx: HostCtx): Promise<AttachmentStatusRes
   for (const f of files) totalBytes += f.sizeBytes;
   let unusedBytes = 0;
   for (const f of unused) unusedBytes += f.sizeBytes;
+  // 回收站占用统计
+  let trashFiles = 0;
+  let trashBytes = 0;
+  const trashDir = attachmentsTrashDir();
+  if (existsTrash(trashDir)) {
+    for (const batch of readdirSync(trashDir)) {
+      const batchDir = join(trashDir, batch);
+      let isDir = false;
+      try {
+        isDir = statSync(batchDir).isDirectory();
+      } catch (e) {
+        isDir = false;
+      }
+      if (!isDir) continue;
+      for (const name of readdirSync(batchDir)) {
+        try {
+          trashBytes += statSync(join(batchDir, name)).size || 0;
+          trashFiles++;
+        } catch (e) {
+          // vanished mid-scan
+        }
+      }
+    }
+  }
   return {
     available: true,
     objectsDir: dir,
@@ -897,16 +964,21 @@ async function handleAttachmentStatus(ctx: HostCtx): Promise<AttachmentStatusRes
     unusedCount: unused.length,
     unusedBytes,
     items: unused.slice(0, 200),
+    trashFiles,
+    trashBytes,
     scannedSessions: scanned,
     durationMs: Date.now() - started
   };
 }
 
 /**
- * Delete the given attachments from the objects store. Hardened: only 64-hex
- * names inside the sharded objects directory are ever touched; per-file
- * failures (e.g. a file briefly locked by AV/indexing on Windows) are
- * collected and reported instead of aborting the batch.
+ * "Clean" the given attachments by MOVING them into the trash staging
+ * directory — nothing is destroyed until the user empties the trash, so a
+ * wrong guess is always recoverable (move the sha back into
+ * objects/<2hex>/). Hardened: only 64-hex names inside the sharded objects
+ * directory are ever touched; per-file failures (e.g. a file briefly locked
+ * by AV/indexing on Windows) are collected and reported instead of aborting
+ * the batch.
  */
 async function handleAttachmentClean(ctx: HostCtx, args: unknown): Promise<Record<string, unknown>> {
   const dir = attachmentsObjectsDir();
@@ -915,21 +987,66 @@ async function handleAttachmentClean(ctx: HostCtx, args: unknown): Promise<Recor
   if (!Array.isArray(raw)) throw new Error("shas 数组必填");
   const shas = raw.filter((s): s is string => typeof s === "string" && /^[0-9a-f]{64}$/.test(s));
   if (shas.length === 0) throw new Error("没有合法的附件 sha");
-  let deleted = 0;
+  const trashBatch = join(attachmentsTrashDir(), new Date().toISOString().replace(/[:.]/g, "-"));
+  mkdirSync(trashBatch, { recursive: true });
+  let moved = 0;
   let freedBytes = 0;
   const errors: string[] = [];
   for (const sha of shas) {
-    const p = join(dir, sha.slice(0, 2), sha);
+    const src = join(dir, sha.slice(0, 2), sha);
     try {
-      const st = statSync(p);
-      unlinkSync(p);
-      deleted++;
+      const st = statSync(src);
+      renameSync(src, join(trashBatch, sha));
+      moved++;
       freedBytes += st.size || 0;
     } catch (e) {
       errors.push(sha.slice(0, 8) + "…: " + String((e && (e as Error).message) || e));
     }
   }
-  return { ok: errors.length === 0, requested: shas.length, deleted, freedBytes, errors };
+  return { ok: errors.length === 0, requested: shas.length, deleted: moved, freedBytes, trashBatch, errors };
+}
+
+/** Permanently delete everything in the trash staging directory. */
+async function handleAttachmentTrashClear(ctx: HostCtx): Promise<Record<string, unknown>> {
+  const trashDir = attachmentsTrashDir();
+  let files = 0;
+  let bytes = 0;
+  if (existsTrash(trashDir)) {
+    for (const batch of readdirSync(trashDir)) {
+      const batchDir = join(trashDir, batch);
+      let isDir = false;
+      try {
+        isDir = statSync(batchDir).isDirectory();
+      } catch (e) {
+        isDir = false;
+      }
+      if (!isDir) continue;
+      for (const name of readdirSync(batchDir)) {
+        const p = join(batchDir, name);
+        try {
+          bytes += statSync(p).size || 0;
+          files++;
+          unlinkSync(p);
+        } catch (e) {
+          // locked/vanished: keep going, report nothing per-file here
+        }
+      }
+      try {
+        rmSync(batchDir, { recursive: true, force: true });
+      } catch (e) {
+        // batch dir itself: best-effort
+      }
+    }
+  }
+  return { ok: true, files, freedBytes: bytes };
+}
+
+function existsTrash(trashDir: string): boolean {
+  try {
+    return statSync(trashDir).isDirectory();
+  } catch (e) {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -966,7 +1083,8 @@ export function apply(ctx: HostCtx): Promise<() => Promise<void>> {
     "auto-archive-one": (args) => handleAutoArchiveOne(ctx, args),
     "auto-exclude": (args) => handleAutoExclude(ctx, args),
     "attachment-status": () => handleAttachmentStatus(ctx),
-    "attachment-clean": (args) => handleAttachmentClean(ctx, args)
+    "attachment-clean": (args) => handleAttachmentClean(ctx, args),
+    "attachment-trash-clear": () => handleAttachmentTrashClear(ctx)
   };
 
   async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
