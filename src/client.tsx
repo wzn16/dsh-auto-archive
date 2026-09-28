@@ -112,11 +112,14 @@ export interface AutoStatus {
 export interface SessionOverview {
   id: string;
   title: string | null;
+  /** Session creation time (what the sidebar's age label shows). */
+  createdAt?: number | null;
   idleDays: number | null;
   lastActiveAt: number | null;
   running: boolean;
   live: boolean;
   excluded: boolean;
+  pinned?: boolean;
   wouldAutoArchive: boolean;
 }
 
@@ -241,6 +244,12 @@ function fmtTime(ms?: number | null): string {
   } catch (e) {
     return String(ms);
   }
+}
+
+/** Whole days since `ms`, floored at zero (for compact "N 天前" labels). */
+function daysAgo(ms?: number | null): number | null {
+  if (!ms) return null;
+  return Math.max(0, Math.floor((Date.now() - ms) / 86400000));
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +480,9 @@ function AutoArchiveCard({ onChanged }: { onChanged: () => void }) {
         <button className="dsw-arch-btn" disabled={anyBusy} onClick={() => save(enabled)}>保存设置</button>
       </div>
       <div className="dsw-auto-status">{statusLine}</div>
+      <div className="dsw-auto-status">
+        闲置按会话最后活跃时间（日志最后写入）计算，非侧边栏显示的创建时间；置顶与手动排除的会话永不自动归档。
+      </div>
       <div className="dsw-auto-row">
         <button className="dsw-arch-btn" disabled={anyBusy} onClick={() => runScan(true)}>
           {busy === "preview" ? "预览中…" : "立即扫描（仅预览）"}
@@ -516,37 +528,42 @@ function AutoArchiveCard({ onChanged }: { onChanged: () => void }) {
                 return (b.idleDays ?? -1) - (a.idleDays ?? -1);
               })
               .slice(0, 200)
-              .map((s) => (
-                <div className="dsw-auto-sess" key={s.id}>
-                  <span className="dsw-auto-sess-title" title={s.id}>
-                    {s.title || s.id}
-                    {s.excluded ? "（已排除）" : ""}
-                    {s.running ? "（运行中）" : ""}
-                  </span>
-                  <span className="dsw-auto-sess-meta">
-                    {s.idleDays === null ? "未知" : "闲置 " + s.idleDays + " 天"}
-                    {s.wouldAutoArchive ? " · 将被自动归档" : ""}
-                  </span>
-                  <span className="dsw-auto-sess-btns">
-                    <button
-                      className="dsw-arch-btn"
-                      disabled={s.running || sessBusy !== null}
-                      onClick={() => archiveOneNow(s.id)}
-                    >
-                      {sessBusy === "archive:" + s.id ? "归档中…" : "归档"}
-                    </button>
-                    {s.excluded ? (
-                      <button className="dsw-arch-btn" disabled={sessBusy !== null} onClick={() => setExcludedNow(s.id, false)}>
-                        取消排除
+              .map((s) => {
+                const createdDays = daysAgo(s.createdAt);
+                return (
+                  <div className="dsw-auto-sess" key={s.id}>
+                    <span className="dsw-auto-sess-title" title={s.id}>
+                      {s.title || s.id}
+                      {s.excluded ? "（已排除）" : ""}
+                      {s.pinned ? "（已置顶）" : ""}
+                      {s.running ? "（运行中）" : ""}
+                    </span>
+                    <span className="dsw-auto-sess-meta">
+                      {createdDays !== null ? "创建 " + createdDays + " 天前 · " : ""}
+                      {s.idleDays === null ? "闲置未知" : "闲置 " + s.idleDays + " 天"}
+                      {s.wouldAutoArchive ? " · 将被自动归档" : ""}
+                    </span>
+                    <span className="dsw-auto-sess-btns">
+                      <button
+                        className="dsw-arch-btn"
+                        disabled={s.running || sessBusy !== null}
+                        onClick={() => archiveOneNow(s.id)}
+                      >
+                        {sessBusy === "archive:" + s.id ? "归档中…" : "归档"}
                       </button>
-                    ) : (
-                      <button className="dsw-arch-btn" disabled={sessBusy !== null} onClick={() => setExcludedNow(s.id, true)}>
-                        永不自动归档
-                      </button>
-                    )}
-                  </span>
-                </div>
-              ))
+                      {s.excluded ? (
+                        <button className="dsw-arch-btn" disabled={sessBusy !== null} onClick={() => setExcludedNow(s.id, false)}>
+                          取消排除
+                        </button>
+                      ) : (
+                        <button className="dsw-arch-btn" disabled={sessBusy !== null} onClick={() => setExcludedNow(s.id, true)}>
+                          永不自动归档
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                );
+              })
           )}
           {sessions !== null && sessions.length > 200 ? (
             <div className="dsw-auto-status">仅显示前 200 个，共 {sessions.length} 个。</div>

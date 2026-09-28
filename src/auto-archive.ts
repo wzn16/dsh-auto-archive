@@ -8,7 +8,8 @@
  *     written for `idleDays` days; its mtime is the last activity time.
  *   - Safety rails: sessions that are currently running a turn are never
  *     touched; sessions that still live in the in-memory store are skipped
- *     conservatively (a truly idle session is evicted anyway); ids on the
+ *     conservatively (a truly idle session is evicted anyway); pinned sessions
+ *     (workspace `pinnedSessionIds`) are never auto-archived; ids on the
  *     user's exclude list are skipped; already-archived ids are skipped.
  *   - Archiving goes through the official `workspaceRegistry.archiveSession`
  *     when available, with a storage-domain fallback that also patches the
@@ -404,6 +405,8 @@ export interface ScanResult {
   skippedLive: number;
   skippedRunning: number;
   skippedExcluded: number;
+  /** Pinned sessions (workspace `pinnedSessionIds`): user keeps them visible. */
+  skippedPinned: number;
   archivedCount: number;
   archived: AutoArchiveHit[];
   preview: AutoArchiveHit[];
@@ -636,6 +639,37 @@ function headerOf(entry: SessionListEntry): SessionHeader | null {
 }
 
 /**
+ * Pinned session ids from the workspace domain, or an empty set.
+ *
+ * Read order mirrors how {@link archiveOne} reaches `archivedSessionIds`:
+ * the registry's direct member, then its private state cache, then a
+ * storage-domain workspace global read. All three are best-effort — a pinned
+ * lookup failure must never break a scan, it only widens the candidate set.
+ */
+function readPinnedIds(ctx: AutoArchiveCtx, registry: WorkspaceRegistry | undefined): Set<string> {
+  const toSet = (raw: unknown): Set<string> | null => {
+    if (!Array.isArray(raw)) return null;
+    return new Set(raw.filter((id): id is string => typeof id === "string" && id.length > 0));
+  };
+  const direct = registry as { pinnedSessionIds?: unknown } | undefined;
+  const fromDirect = direct ? toSet(direct.pinnedSessionIds) : null;
+  if (fromDirect) return fromDirect;
+  const state = registry && typeof registry === "object" ? (registry as { state?: unknown }).state : null;
+  const fromState = toSet(state !== null && typeof state === "object" ? (state as { pinnedSessionIds?: unknown }).pinnedSessionIds : null);
+  if (fromState) return fromState;
+  try {
+    const domain = ctx.get<StorageDomainService>("storageDomain");
+    const workspace = domain && typeof domain.get === "function" ? domain.get("workspace") : undefined;
+    const globalStore = workspace && workspace.global && typeof workspace.global.get === "function" ? workspace.global.get() : null;
+    const fromDomain = toSet(globalStore !== null && typeof globalStore === "object" ? (globalStore as { pinnedSessionIds?: unknown }).pinnedSessionIds : null);
+    if (fromDomain) return fromDomain;
+  } catch (e) {
+    // best-effort: treat as "nothing pinned"
+  }
+  return new Set<string>();
+}
+
+/**
  * Last-activity mtime of a session, or null when unresolvable.
  *
  * `persistence.locate()` only COMPUTES the current-generation path
@@ -703,6 +737,7 @@ export async function scanAndArchive(ctx: AutoArchiveCtx, opts: { dryRun: boolea
     skippedLive: 0,
     skippedRunning: 0,
     skippedExcluded: 0,
+    skippedPinned: 0,
     archivedCount: 0,
     archived: [],
     preview: [],
@@ -710,6 +745,7 @@ export async function scanAndArchive(ctx: AutoArchiveCtx, opts: { dryRun: boolea
   };
 
   const excluded = new Set(config.excludeIds);
+  const pinned = readPinnedIds(ctx, registry);
   const candidates: Array<{ header: SessionHeader; lastActiveAt: number; idleDays: number }> = [];
 
   for (const entry of entries) {
@@ -720,6 +756,13 @@ export async function scanAndArchive(ctx: AutoArchiveCtx, opts: { dryRun: boolea
 
     if (excluded.has(header.id)) {
       result.skippedExcluded++;
+      continue;
+    }
+
+    // A pinned session is the user's explicit "keep this in my face" — the
+    // idle rule never applies to it, no matter how cold its files are.
+    if (pinned.has(header.id)) {
+      result.skippedPinned++;
       continue;
     }
 
@@ -801,6 +844,8 @@ export async function scanAndArchive(ctx: AutoArchiveCtx, opts: { dryRun: boolea
 export interface SessionOverview {
   id: string;
   title: string | null;
+  /** Session creation time from its header (what the sidebar's age label shows). */
+  createdAt: number | null;
   /** Whole days since last write; null when the artifact is unreadable. */
   idleDays: number | null;
   lastActiveAt: number | null;
@@ -808,7 +853,9 @@ export interface SessionOverview {
   /** Present in the in-memory store (kept out of auto-archive). */
   live: boolean;
   excluded: boolean;
-  /** Would the NEXT scan archive it? (idle threshold met, not excluded). */
+  /** Pinned in the workspace (kept out of auto-archive). */
+  pinned: boolean;
+  /** Would the NEXT scan archive it? (idle threshold met, not excluded/pinned). */
   wouldAutoArchive: boolean;
 }
 
@@ -825,6 +872,7 @@ export async function listAllSessions(ctx: AutoArchiveCtx): Promise<SessionOverv
   const excluded = new Set(config.excludeIds);
   const rawArchived = registry && registry.archivedSessionIds;
   const archivedSet = new Set<string>(Array.isArray(rawArchived) ? rawArchived : []);
+  const pinned = readPinnedIds(ctx, registry);
   const idleMs = config.idleDays * 24 * 60 * 60 * 1000;
   const now = Date.now();
 
@@ -850,15 +898,19 @@ export async function listAllSessions(ctx: AutoArchiveCtx): Promise<SessionOverv
     const idleDays =
       r.lastActiveAt === null ? null : Math.max(0, Math.floor((now - r.lastActiveAt) / (24 * 60 * 60 * 1000)));
     const meetsIdle = r.lastActiveAt !== null && now - r.lastActiveAt >= idleMs;
+    const isPinned = pinned.has(r.header.id);
+    const isExcluded = excluded.has(r.header.id);
     return {
       id: r.header.id,
       title: titles.get(r.header.id) || null,
+      createdAt: r.header.createdAt || null,
       idleDays,
       lastActiveAt: r.lastActiveAt,
       running: r.running,
       live: r.live,
-      excluded: excluded.has(r.header.id),
-      wouldAutoArchive: meetsIdle && !excluded.has(r.header.id) && !r.live && !r.running
+      excluded: isExcluded,
+      pinned: isPinned,
+      wouldAutoArchive: meetsIdle && !isExcluded && !isPinned && !r.live && !r.running
     };
   });
 }
