@@ -123,6 +123,24 @@ export interface SessionOverview {
   wouldAutoArchive: boolean;
 }
 
+export interface AttachmentItem {
+  sha: string;
+  sizeBytes: number;
+  mtime: number;
+}
+
+export interface AttachmentStatus {
+  available: boolean;
+  objectsDir?: string | null;
+  totalFiles: number;
+  totalBytes: number;
+  unusedCount: number;
+  unusedBytes: number;
+  items: AttachmentItem[];
+  scannedSessions: number;
+  durationMs: number;
+}
+
 interface ApiEnvelope {
   error?: string;
 }
@@ -575,6 +593,140 @@ function AutoArchiveCard({ onChanged }: { onChanged: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
+// Attachment cleanup card
+// ---------------------------------------------------------------------------
+
+/**
+ * Attachment store cleanup linked to session archiving. Lists files under
+ * attachments/v1/objects that NO not-yet-archived session references (only
+ * archived or already-deleted sessions used them) and offers a two-step
+ * confirmed cleanup. Scan decompresses every live session log, so it takes
+ * seconds — it never runs automatically.
+ */
+function AttachmentCleanupCard() {
+  const [status, setStatus] = React.useState<AttachmentStatus | null>(null);
+  const [scanning, setScanning] = React.useState(false);
+  const [armed, setArmed] = React.useState(false);
+  const [cleaning, setCleaning] = React.useState(false);
+  const [notice, setNotice] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  function describe(err: unknown): string {
+    if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
+      return (err as { message: string }).message;
+    }
+    return String(err);
+  }
+
+  function scan(): void {
+    setScanning(true);
+    setError(null);
+    setNotice(null);
+    setArmed(false);
+    api<AttachmentStatus>("attachment-status", {})
+      .then((res) => {
+        setStatus(res);
+        setScanning(false);
+      })
+      .catch((err) => {
+        setError(describe(err));
+        setScanning(false);
+      });
+  }
+
+  function clean(): void {
+    if (!status || status.unusedCount === 0) return;
+    setCleaning(true);
+    setError(null);
+    setNotice(null);
+    const shas = status.items.map((i) => i.sha);
+    api<{ ok: boolean; deleted: number; freedBytes: number; errors: string[] }>("attachment-clean", { shas })
+      .then((res) => {
+        setNotice(
+          "已清理 " + res.deleted + " 个附件，释放 " + fmtSize(res.freedBytes) +
+            (res.errors && res.errors.length > 0 ? "；" + res.errors.length + " 个失败" : "")
+        );
+        setArmed(false);
+        setCleaning(false);
+        scan();
+      })
+      .catch((err) => {
+        setError(describe(err));
+        setCleaning(false);
+      });
+  }
+
+  return (
+    <div className="dsw-auto-card">
+      <div className="dsw-auto-head">
+        <span className="dsw-auto-title">附件清理</span>
+        <span className="dsw-auto-status">
+          找出未被任何未归档会话引用的贴图附件（只被已归档/已删除会话使用），清理不可逆
+        </span>
+      </div>
+      <div className="dsw-auto-row">
+        <button className="dsw-arch-btn" disabled={scanning || cleaning} onClick={() => scan()}>
+          {scanning ? "扫描中…（全量解压会话日志，约十几秒）" : "扫描可清理附件"}
+        </button>
+        {status && status.available ? (
+          <span className="dsw-auto-status">
+            附件共 {status.totalFiles} 个 / {fmtSize(status.totalBytes)}；可清理{" "}
+            <strong>
+              {status.unusedCount} 个 / {fmtSize(status.unusedBytes)}
+            </strong>
+            （扫描 {status.scannedSessions} 个会话 · {(status.durationMs / 1000).toFixed(1)}s）
+          </span>
+        ) : null}
+        {status && !status.available ? (
+          <span className="dsw-auto-status">未找到 attachments/v1/objects 目录。</span>
+        ) : null}
+      </div>
+      {armed && status ? (
+        <div className="dsw-auto-row">
+          <span className="dsw-auto-status" style={{ color: "var(--dsw-alias-state-warn-primary)" }}>
+            确认永久删除 {status.items.length} 个附件文件（{fmtSize(status.unusedBytes)}）？不可恢复。
+          </span>
+          <button className="dsw-arch-btn dsw-arch-btn-danger" disabled={cleaning} onClick={() => clean()}>
+            {cleaning ? "清理中…" : "确认清理"}
+          </button>
+          <button className="dsw-arch-btn" disabled={cleaning} onClick={() => setArmed(false)}>取消</button>
+        </div>
+      ) : null}
+      {status && status.unusedCount > 0 && !armed ? (
+        <div className="dsw-auto-row">
+          <button className="dsw-arch-btn dsw-arch-btn-danger" disabled={cleaning} onClick={() => setArmed(true)}>
+            清理这 {status.unusedCount} 个附件…
+          </button>
+        </div>
+      ) : null}
+      {notice ? (
+        <div className="dsw-auto-status" style={{ color: "var(--dsw-alias-state-success-primary, var(--dsw-alias-brand-primary))" }}>
+          {notice}
+        </div>
+      ) : null}
+      {error ? <div className="dsw-arch-error">{error}</div> : null}
+      {status && status.items.length > 0 ? (
+        <div className="dsw-auto-sesslist">
+          {status.items.slice(0, 10).map((it) => (
+            <div className="dsw-auto-sess" key={it.sha}>
+              <span className="dsw-auto-sess-title" title={it.sha}>
+                {it.sha.slice(0, 16)}…
+              </span>
+              <span className="dsw-auto-sess-meta">
+                {fmtSize(it.sizeBytes)} · 最后修改 {fmtTime(it.mtime)}
+              </span>
+            </div>
+          ))}
+          {status.items.length > 10 ? (
+            <div className="dsw-auto-status">…及其他 {status.items.length - 10} 个</div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page component
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1097,7 @@ function refreshViews(): void {}
     <div className="dsw-arch-page">
       {errorEl}
       <AutoArchiveCard onChanged={load} />
+      <AttachmentCleanupCard />
       {header}
       {confirmBar}
       {body}

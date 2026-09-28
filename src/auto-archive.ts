@@ -158,7 +158,8 @@ const rawTitleCache = new Map<string, string | null>();
 /** Hard cap per session log to bound decompression work. */
 const RAW_TEXT_LIMIT = 4 * 1024 * 1024;
 
-function decompressMultiFrame(buf: Buffer): string {
+/** Multi-frame zstd → text; also the shared decompressor for attachment scans. */
+export function decompressMultiFrame(buf: Buffer): string {
   const offs: number[] = [];
   for (let i = 0; i <= buf.length - 4; i++) {
     if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) {
@@ -301,7 +302,6 @@ export async function resolveTitles(
     pending.push(id);
   }
   if (pending.length === 0) return titles;
-  const titleDeadline = Date.now() + 20000;
   if (query && typeof query.readTitleSnapshots === "function") {
     try {
       const results = await query.readTitleSnapshots(pending);
@@ -311,17 +311,47 @@ export async function resolveTitles(
         }
       }
     } catch (e) {
-      // fall through to the per-session fallback
+      // fall through to the local tiers
     }
   }
 
+  // Second tier: cold sessions the query service refuses to transform (v0 and
+  // other legacy generations) — read the generation logs straight from disk.
+  //
+  // Runs BEFORE readSession on purpose. It is the only tier that can read
+  // those legacy artifacts, it is plain local zstd decompression (fast), and
+  // each tier now gets its OWN deadline: previously it ran last behind the
+  // single 20s deadline that the readSession pool burned down first, so every
+  // load re-spent ~20s on sessions it could never resolve and the raw tier
+  // never executed at all (2026-09-28: 175/248 archived sessions hit exactly
+  // that path on every list call).
+  const rawLogDeadline = Date.now() + 15000;
+  const stillMissing = pending.filter((id) => !titles.has(id));
+  if (stillMissing.length > 0 && headerById && persistenceForRawLog) {
+    const persistence = persistenceForRawLog();
+    if (persistence) {
+      for (const id of stillMissing) {
+        if (Date.now() > rawLogDeadline) break;
+        const header = headerById(id);
+        if (!header) continue;
+        const title = rawLogTitle(persistence, header);
+        if (title) titles.set(id, title);
+      }
+    }
+  }
+
+  // Last tier: sessions the two local tiers could not read but the query
+  // service still can (e.g. artifacts on a backend node:fs cannot see).
+  // Shortest budget — slowest per-session transform, mostly redundant with the
+  // tiers above.
   const missing = pending.filter((id) => !titles.has(id));
   const readSession = query && typeof query.readSession === "function" ? query.readSession.bind(query) : null;
   if (missing.length > 0 && readSession) {
+    const readSessionDeadline = Date.now() + 5000;
     let cursor = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
-        if (Date.now() > titleDeadline) return;
+        if (Date.now() > readSessionDeadline) return;
         const i = cursor++;
         if (i >= missing.length) return;
         const id = missing[i];
@@ -333,27 +363,11 @@ export async function resolveTitles(
             if (title) titles.set(id, title);
           }
         } catch (e) {
-          // unreadable through the query service; the raw-log tier may still work
+          // unreadable through the query service; nothing more to try
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(8, missing.length) }, () => worker()));
-  }
-
-  // Third tier: cold sessions the query service refuses to transform (v0 and
-  // other legacy generations). Read the generation logs straight from disk.
-  const stillMissing = pending.filter((id) => !titles.has(id));
-  if (stillMissing.length > 0 && headerById && persistenceForRawLog) {
-    const persistence = persistenceForRawLog();
-    if (persistence) {
-      for (const id of stillMissing) {
-        if (Date.now() > titleDeadline) break;
-        const header = headerById(id);
-        if (!header) continue;
-        const title = rawLogTitle(persistence, header);
-        if (title) titles.set(id, title);
-      }
-    }
   }
   // 成功标题落盘，跨启动复用；本轮预算内没解出来的下轮继续
   for (const [id, t] of titles) {
@@ -513,6 +527,11 @@ export function seedHomeRootFromArtifact(artifactPath: string): void {
 
 /** Exposed for tests / diagnostics. */
 export function homeRootForTest(): string | null {
+  return cachedHomeRoot;
+}
+
+/** Harness home root (once derived), e.g. ~/.dsh — used to locate attachments. */
+export function harnessHomeRoot(): string | null {
   return cachedHomeRoot;
 }
 
