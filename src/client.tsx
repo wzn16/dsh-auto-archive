@@ -151,7 +151,6 @@ interface ApiEnvelope {
 // Styles
 // ---------------------------------------------------------------------------
 
-const STYLE_ID = "dsw-arch-style";
 const CSS = [
   ".dsw-arch-page{font-size:13px;padding:2px 2px 24px;}",
   ".dsw-arch-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;}",
@@ -206,17 +205,9 @@ const CSS = [
   ".dsw-auto-sess-btns{white-space:nowrap;}"
 ].join("");
 
-function ensureStyle(): void {
-  try {
-    if (document.getElementById(STYLE_ID)) return;
-    const el = document.createElement("style");
-    el.id = STYLE_ID;
-    el.textContent = CSS;
-    document.head.appendChild(el);
-  } catch (e) {
-    // ignore
-  }
-}
+// 样式不再注入 document.head：官方壳更新后设置页的渲染环境可能隔离
+// （Shadow DOM / CSP 清理），head 注入会整体失效——样式改为随组件树渲染，
+// 见 ArchivedSessionsPage 根节点内的 <style>，卸载随组件自动移除。
 
 // ---------------------------------------------------------------------------
 // API
@@ -1188,6 +1179,8 @@ function refreshViews(): void {}
 
   return (
     <div className="dsw-arch-page">
+      {/* 样式随组件树渲染：head 注入在 Shadow DOM/CSP 环境会整体失效 */}
+      <style>{CSS}</style>
       {errorEl}
       <AutoArchiveCard onChanged={load} />
       <AttachmentCleanupCard />
@@ -1217,18 +1210,6 @@ function refreshViews(): void {}
 export const inject = ["slots", "workspaces"];
 
 export function apply(ctx: ClientCtx): void {
-  ensureStyle();
-  ctx.effect(() => {
-    return () => {
-      try {
-        const el = document.getElementById(STYLE_ID);
-        if (el) el.remove();
-      } catch (e) {
-        // ignore
-      }
-    };
-  }, "ui-archived-sessions: style cleanup");
-
   ctx.slots.inject("settings.section", () =>
     ctx.slots.register(
       { name: "settings.section", id: "archived-sessions", order: 30, label: () => "归档会话" },
